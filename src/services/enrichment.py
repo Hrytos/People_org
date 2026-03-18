@@ -79,7 +79,7 @@ class EnrichmentService:
     def poll_for_results(
         self,
         enrichment_id: str,
-        timeout: int = 180,
+        timeout: int = 600,
         poll_interval: int = 10
     ) -> Optional[Dict]:
         """
@@ -101,14 +101,16 @@ class EnrichmentService:
         start_time = time.time()
         elapsed = 0
         
-        while elapsed < timeout:
+        completed_statuses = {"FINISHED", "COMPLETED", "SUCCESS", "DONE"}
+
+        while elapsed <= timeout:
             try:
                 result = self.fullenrich.get_enrichment_result(enrichment_id)
                 status = result.get("status", "UNKNOWN")
                 
                 logger.info(f"Status: {status} ({elapsed}s elapsed)")
                 
-                if status == "FINISHED":
+                if status in completed_statuses:
                     logger.info(f"✅ Enrichment completed in {elapsed}s")
                     # Log response structure for debugging
                     import json
@@ -139,6 +141,18 @@ class EnrichmentService:
                 logger.error(f"Unexpected error during polling: {e}")
                 return None
         
+        # One last attempt to fetch partial results at timeout boundary.
+        # FullEnrich can still return usable records even before final status.
+        try:
+            partial = self.fullenrich.get_enrichment_result(enrichment_id, force_results=True)
+            if partial.get("datas"):
+                logger.warning(
+                    f"⏱️ Timeout reached, returning partial results: {len(partial.get('datas', []))} contacts"
+                )
+                return partial
+        except Exception as e:
+            logger.debug(f"No partial results available after timeout: {e}")
+
         logger.warning(f"⏱️ Polling timeout after {timeout}s")
         return None
     
@@ -170,17 +184,31 @@ class EnrichmentService:
     def save_to_final_tables(
         self,
         accounts: List[Dict],
-        contacts: List[Dict]
+        contacts: List[Dict],
+        selected_account_id: Optional[str] = None,
+        skip_duplicates: bool = True
     ) -> tuple:
         """
-        Persist enriched data to DB (accounts_test, contacts_test).
+        Persist enriched data to DB.
         Call this only when user clicks Save.
+        
+        Args:
+            accounts: Mapped account dicts (unused for insert, no new accounts created)
+            contacts: Mapped contact dicts to save
+            selected_account_id: If user selected an existing account from dropdown,
+                                  this UUID is stamped on every contact directly —
+                                  skipping the company_name lookup entirely.
+            skip_duplicates: If True, existing contacts are skipped (not updated).
         
         Returns:
             Tuple of (accounts_count, contacts_count)
         """
-        logger.info(f"Saving to DB: {len(accounts)} accounts, {len(contacts)} contacts")
-        acc_count, con_count = self.db.insert_all(accounts, contacts)
+        logger.info(f"Saving to DB: {len(contacts)} contacts (selected_account_id={selected_account_id}, skip_duplicates={skip_duplicates})")
+        acc_count, con_count = self.db.insert_all(
+            accounts, contacts, 
+            selected_account_id=selected_account_id,
+            skip_duplicates=skip_duplicates
+        )
         logger.info(f"Saved: {acc_count} accounts, {con_count} contacts")
         return acc_count, con_count
 

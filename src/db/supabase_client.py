@@ -71,17 +71,43 @@ class SupabaseClient:
         Returns list of {account_id, company_name, account_domain, ...}.
         """
         try:
-            # Select columns from user's schema
+            # Select columns from user's schema.
             cols = "account_id, company_name, account_domain, linkedin_url, employee_count"
-            # Fallback chain if some columns don't exist
+            page_size = min(limit, 1000)
+
+            # Fallback chain if some columns don't exist.
             for col_set in (cols, "account_id, company_name, account_domain", "*"):
                 try:
-                    result = self.client.table(ACCOUNTS_TABLE).select(col_set).order(
-                        "company_name"
-                    ).limit(limit).execute()
-                    return result.data if result.data else []
+                    all_rows: List[Dict[str, Any]] = []
+                    start = 0
+
+                    while start < limit:
+                        end = min(start + page_size - 1, limit - 1)
+                        result = (
+                            self.client
+                            .table(ACCOUNTS_TABLE)
+                            .select(col_set)
+                            .order("company_name")
+                            .range(start, end)
+                            .execute()
+                        )
+
+                        page_rows = result.data if result.data else []
+                        if not page_rows:
+                            break
+
+                        all_rows.extend(page_rows)
+
+                        # Last page reached.
+                        if len(page_rows) < page_size:
+                            break
+
+                        start += page_size
+
+                    return all_rows
                 except Exception:
                     continue
+
             return []
         except Exception as e:
             logger.error(f"Get accounts failed: {e}")
@@ -152,18 +178,30 @@ class SupabaseClient:
     def upsert_contacts(
         self,
         contacts: List[Dict[str, Any]],
-    ) -> Tuple[int, int]:
+        forced_account_id: Optional[str] = None,
+        skip_duplicates: bool = False,
+    ) -> Tuple[int, int, int]:
         """
         Upsert into your contacts table.
         - email is required (NOT NULL UNIQUE); contacts without email are skipped.
-        - account_id is resolved from your accounts table by company_name.
+        - If forced_account_id is provided (user picked an account from the dropdown),
+          it is stamped on EVERY contact unconditionally — no name lookup needed.
+        - Otherwise, account_id is resolved by company_name lookup.
+        - If skip_duplicates=True, existing contacts are skipped (not updated).
+        
+        Returns:
+            (inserted_count, updated_count, skipped_count)
         """
         if not contacts:
-            return 0, 0
+            return 0, 0, 0
+
+        if forced_account_id:
+            logger.info(f"Forced account_id for all contacts: {forced_account_id}")
 
         inserted = 0
         updated = 0
         skipped_no_email = 0
+        skipped_duplicate = 0
 
         for contact in contacts:
             row = self._contact_to_row(contact)
@@ -173,37 +211,51 @@ class SupabaseClient:
                 logger.debug("Skipping contact with no email")
                 continue
 
-            company_name = row.get("company_name")
-            if company_name and not row.get("account_id"):
-                row["account_id"] = self.get_account_id_by_company_name(company_name)
+            if forced_account_id:
+                # ✅ User chose an existing account — use it directly, no lookup
+                row["account_id"] = forced_account_id
+            else:
+                # Fallback: resolve by company_name if account_id still missing
+                company_name = row.get("company_name")
+                if company_name and not row.get("account_id"):
+                    row["account_id"] = self.get_account_id_by_company_name(company_name)
 
             existing = self._find_contact_by_email(email)
 
             if existing:
-                try:
-                    update_data = {k: v for k, v in row.items() if k != "email"}
-                    update_data["updated_at"] = datetime.now().isoformat()
-                    self.client.table(CONTACTS_TABLE).update(update_data).eq(
-                        "id", existing["id"]
-                    ).execute()
-                    updated += 1
-                    logger.debug(f"Updated contact: {email}")
-                except Exception as e:
-                    logger.error(f"Contact update failed: {e}")
+                if skip_duplicates:
+                    # Don't update existing contacts — skip them
+                    skipped_duplicate += 1
+                    logger.info(f"Skipped duplicate contact: {email}")
+                    continue
+                else:
+                    # Update existing contact
+                    try:
+                        update_data = {k: v for k, v in row.items() if k != "email"}
+                        update_data["updated_at"] = datetime.now().isoformat()
+                        self.client.table(CONTACTS_TABLE).update(update_data).eq(
+                            "id", existing["id"]
+                        ).execute()
+                        updated += 1
+                        logger.info(f"Updated existing contact: {email}")
+                    except Exception as e:
+                        logger.error(f"Contact update failed: {e}")
             else:
                 try:
                     # Let DB generate id; include created_at default
                     insert_row = {k: v for k, v in row.items()}
                     self.client.table(CONTACTS_TABLE).insert(insert_row).execute()
                     inserted += 1
-                    logger.debug(f"Inserted contact: {email}")
+                    logger.info(f"Inserted new contact: {email}")
                 except Exception as e:
                     logger.error(f"Contact insert failed: {e}")
 
         if skipped_no_email:
             logger.info(f"Skipped {skipped_no_email} contacts (no email)")
+        if skipped_duplicate:
+            logger.info(f"Skipped {skipped_duplicate} duplicate contacts")
         logger.info(f"Contacts: {inserted} inserted, {updated} updated")
-        return inserted, updated
+        return inserted, updated, skipped_duplicate
 
     def _find_contact_by_email(self, email: str) -> Optional[Dict]:
         """Find contact by email (your table has unique constraint on email)."""
@@ -222,21 +274,30 @@ class SupabaseClient:
         self,
         accounts: List[Dict[str, Any]],
         contacts: List[Dict[str, Any]],
+        selected_account_id: Optional[str] = None,
+        skip_duplicates: bool = True,
     ) -> Tuple[int, int]:
         """
-        Resolve account_id for each contact from your accounts table (by company_name),
-        then upsert contacts only. We do not insert into accounts.
-        Returns (0, total_contacts) for accounts count since we don't write accounts.
-        """
-        account_id_map = {}
-        for contact in contacts:
-            company_name = contact.get("company_name") or contact.get("account") or ""
-            if company_name and company_name not in account_id_map:
-                account_id_map[company_name] = self.get_account_id_by_company_name(company_name)
-            contact["account_id"] = account_id_map.get(company_name) if company_name else None
+        Upsert contacts only. We never create new accounts.
 
-        con_inserted, con_updated = self.upsert_contacts(contacts)
-        return 0, con_inserted + con_updated
+        If selected_account_id is provided (user chose an account from the dropdown),
+        that UUID is stamped directly on every contact — overriding anything the
+        mapper may have set (mapper generates throwaway UUIDs for display only).
+
+        If no selected_account_id, we fall back to resolving by company_name.
+        
+        Args:
+            skip_duplicates: If True, existing contacts are skipped (not updated).
+                            Default: True to avoid overwriting existing data.
+        """
+        con_inserted, con_updated, con_skipped = self.upsert_contacts(
+            contacts, 
+            forced_account_id=selected_account_id,
+            skip_duplicates=skip_duplicates
+        )
+        total_saved = con_inserted + con_updated
+        logger.info(f"Total saved: {total_saved} ({con_inserted} new, {con_updated} updated, {con_skipped} skipped)")
+        return 0, total_saved
 
     # =========================================================================
     # Enrichment History

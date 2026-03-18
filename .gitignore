@@ -59,6 +59,5 @@ Thumbs.db
 *.xlsx
 !example_*.csv
 
-# Tunnels
-ngrok.yml
-cloudflared.yml
+/mapping
+/Org_analyser

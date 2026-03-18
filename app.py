@@ -11,6 +11,8 @@ Following the Rulebook for UI/UX best practices.
 import streamlit as st
 import pandas as pd
 import sys
+import re
+from io import StringIO
 from pathlib import Path
 from datetime import datetime
 
@@ -63,11 +65,15 @@ def init_session_state():
     if 'company_data' not in st.session_state:
         st.session_state.company_data = None
     if 'selected_account' not in st.session_state:
-        st.session_state.selected_account = None  # From accounts table if dropdown used
+        st.session_state.selected_account = None  # Full account dict from dropdown
+    if 'selected_account_id' not in st.session_state:
+        st.session_state.selected_account_id = None  # Dedicated UUID — used at save time
     if 'selected_people' not in st.session_state:
         st.session_state.selected_people = []
     if 'enrichment_results' not in st.session_state:
         st.session_state.enrichment_results = None
+    if 'skip_duplicates' not in st.session_state:
+        st.session_state.skip_duplicates = True
 
 
 def reset_state():
@@ -76,8 +82,79 @@ def reset_state():
     st.session_state.search_results = None
     st.session_state.company_data = None
     st.session_state.selected_account = None
+    st.session_state.selected_account_id = None
     st.session_state.selected_people = []
     st.session_state.enrichment_results = None
+    st.session_state.skip_duplicates = True
+
+
+def parse_csv_values(raw: str) -> list[str]:
+    """Parse comma/newline-separated user input into a cleaned list."""
+    if not raw:
+        return []
+    return [item.strip() for item in re.split(r"[,\n]+", raw) if item and item.strip()]
+
+
+FILTERS_DIR = Path(__file__).parent / "src" / "core" / "filters"
+
+
+def load_default_filter_text(filename: str) -> str:
+    """Load multiline defaults from a text file in src/core/filters."""
+    file_path = FILTERS_DIR / filename
+    try:
+        return file_path.read_text(encoding="utf-8").strip()
+    except Exception as e:
+        logger.warning(f"Could not load filter defaults from {file_path}: {e}")
+        return ""
+
+
+def normalize_linkedin_url(url: str) -> str:
+    """Normalize LinkedIn person URL for matching and dedupe."""
+    if not url:
+        return ""
+    clean = url.strip()
+    clean = re.sub(r"\?.*$", "", clean)
+    clean = clean.rstrip("/")
+    return clean
+
+
+def extract_linkedin_urls(raw_urls: str, csv_file) -> list[str]:
+    """Extract LinkedIn profile URLs from text input and optional CSV upload."""
+    candidates: list[str] = []
+
+    if raw_urls:
+        for token in re.split(r"[,\n\s;]+", raw_urls):
+            if token and "linkedin.com/in/" in token.lower():
+                candidates.append(token.strip())
+
+    if csv_file is not None:
+        try:
+            csv_text = csv_file.getvalue().decode("utf-8", errors="ignore")
+            df = pd.read_csv(StringIO(csv_text))
+
+            linkedin_columns = [
+                col for col in df.columns
+                if "linkedin" in str(col).lower() or "url" in str(col).lower()
+            ]
+
+            for col in linkedin_columns:
+                for value in df[col].dropna().astype(str).tolist():
+                    if "linkedin.com/in/" in value.lower():
+                        candidates.append(value)
+
+            # Fallback scan all cells for linkedin profile URLs.
+            if not candidates and not df.empty:
+                pattern = re.compile(r"https?://(?:www\.)?linkedin\.com/in/[^\s,;]+", re.IGNORECASE)
+                for value in df.astype(str).values.flatten().tolist():
+                    for match in pattern.findall(value):
+                        candidates.append(match)
+
+        except Exception as e:
+            logger.warning(f"Failed parsing LinkedIn CSV upload: {e}")
+
+    normalized = [normalize_linkedin_url(u) for u in candidates]
+    filtered = [u for u in normalized if "linkedin.com/in/" in u.lower()]
+    return list(dict.fromkeys(filtered))
 
 
 # =============================================================================
@@ -155,8 +232,7 @@ def render_search_step():
     """Step 1: Search for people at a company."""
     st.markdown('<span class="step-badge">STEP 1</span>', unsafe_allow_html=True)
     st.header("Find People at Company")
-    
-    st.info("💡 **Tip:** Search returns people with their LinkedIn profiles and job titles")
+    st.info("💡 Use either an existing account or a company domain, then adjust filters before searching")
     
     # Load existing accounts for dropdown (increased limit for large account lists)
     try:
@@ -172,105 +248,148 @@ def render_search_step():
     except Exception as e:
         logger.warning(f"Could not load accounts: {e}")
         account_options = {}
+
+    default_titles_text = load_default_filter_text("titles_included.txt")
+    default_excluded_titles_text = load_default_filter_text("titles_excluded.txt")
     
     with st.form("search_form"):
-        # ========== SECTION 1: Select Existing Account ==========
+        st.subheader("🏢 Option A: Existing Account")
         if account_options:
-            st.subheader("🏢 Select Existing Account")
-            st.caption(f"💡 {len(account_options)} accounts available - start typing to search")
-            
-            col1, col2 = st.columns([3, 1])
-            
-            with col1:
-                selected_account = st.selectbox(
-                    "Choose from existing accounts (optional)",
-                    options=[""] + sorted(account_options.keys()),
-                    format_func=lambda x: "Type below or select..." if x == "" else x,
-                    help="Quick select from your existing accounts. Start typing to filter."
-                )
-            
-            with col2:
-                account_limit = st.number_input(
-                    "Max Results",
-                    min_value=10,
-                    max_value=100,
-                    value=25,
-                    step=5,
-                    key="account_limit"
-                )
-            
-            account_title = st.text_input(
-                "Job Title (optional)",
-                placeholder="e.g., VP of Engineering, Director of Sales",
-                help="Filter by job title (partial match)",
-                key="account_title"
+            selected_account = st.selectbox(
+                "Choose from existing accounts (optional)",
+                options=[""] + sorted(account_options.keys()),
+                format_func=lambda x: "Type to search or select..." if x == "" else x,
+                help="Start typing to filter company names"
             )
         else:
+            st.caption("No accounts available from database right now")
             selected_account = ""
-            account_limit = 25
-            account_title = ""
-        
-        st.divider()
-        
-        # ========== SECTION 2: Enter Company Domain ==========
-        st.subheader("🔍 Or Enter Company Domain")
-        
-        col1, col2 = st.columns([3, 1])
-        
-        with col1:
-            company_domain_input = st.text_input(
-                "Company Domain *",
-                placeholder="e.g., google.com, openai.com, tesla.com",
-                help="Enter company domain (e.g., company.com)",
-                key="domain_input"
-            )
-        
-        with col2:
-            domain_limit = st.number_input(
-                "Max Results",
-                min_value=10,
-                max_value=100,
-                value=25,
-                step=5,
-                key="domain_limit"
-            )
-        
-        domain_title = st.text_input(
-            "Job Title (optional)",
-            placeholder="e.g., VP of Engineering, Director of Sales",
-            help="Filter by job title (partial match)",
-            key="domain_title"
+
+        st.subheader("🔎 Option B: Enter Company Domain")
+        company_domain_input = st.text_input(
+            "Company domain",
+            placeholder="e.g., google.com, openai.com",
+            help="Use domain when possible for best FullEnrich precision"
         )
-        
+
+        with st.expander("Job titles include filter (optional)", expanded=False):
+            titles_raw = st.text_area(
+                "Current position titles",
+                value=default_titles_text,
+                height=220,
+                help="One title per line, or comma-separated values"
+            )
+
+        with st.expander("Job titles exclude filter (optional)", expanded=False):
+            excluded_titles_raw = st.text_area(
+                "Exclude current position titles",
+                value=default_excluded_titles_text,
+                height=260,
+                help="One title per line, or comma-separated values"
+            )
+
+        target_count = st.number_input(
+            "People to fetch",
+            min_value=25,
+            max_value=500,
+            value=100,
+            step=25,
+            help="Fetches profiles in pages up to this target count"
+        )
+
+        person_locations_raw = st.text_input(
+            "Person locations (optional)",
+            value="United States",
+            placeholder="San Francisco, California, United States"
+        )
+
         submitted = st.form_submit_button("🔍 Search People", type="primary", width="stretch")
         
         if submitted:
             # Determine which section was used
             if selected_account and selected_account != "":
-                # ===== SECTION 1: Using existing account =====
+                # ===== SECTION 1: Using existing account from dropdown =====
                 company_name = selected_account
                 account_data = account_options.get(selected_account)
                 st.session_state.selected_account = account_data
+                # ✅ Store account_id explicitly — this is used at save time
+                st.session_state.selected_account_id = account_data.get("account_id")
                 domain = account_data.get("account_domain", "")
-                title = account_title
-                limit = account_limit
+                titles = parse_csv_values(titles_raw)
                 
             elif company_domain_input:
                 # ===== SECTION 2: Using manual domain entry =====
-                company_name = company_domain_input  # Use domain as identifier
+                company_name = company_domain_input.split(".")[0]
                 st.session_state.selected_account = None
-                domain = company_domain_input  # Direct domain input
-                title = domain_title
-                limit = domain_limit
+                st.session_state.selected_account_id = None  # No dropdown selection
+                domain = company_domain_input
+                titles = parse_csv_values(titles_raw)
                 
             else:
                 st.error("Please either select an existing account OR enter a company domain")
                 return
             
-            run_people_search(company_name, title, limit, domain)
+            person_locations = parse_csv_values(person_locations_raw)
+            excluded_titles = parse_csv_values(excluded_titles_raw)
+
+            run_people_search(
+                company_name=company_name,
+                titles=titles,
+                excluded_titles=excluded_titles,
+                person_locations=person_locations,
+                limit=int(target_count),
+                domain=domain,
+            )
+
+    st.divider()
+    st.subheader("🔗 Search by LinkedIn URLs")
+    st.caption("Use this section when you already have person LinkedIn profile URLs")
+
+    with st.form("linkedin_url_search_form"):
+        linkedin_selected_account_name = st.selectbox(
+            "Select account for save/enrichment context (optional)",
+            options=[""] + sorted(account_options.keys()),
+            format_func=lambda x: "No account selected" if x == "" else x,
+            help="This account will be used for contact save linking and enrichment company context"
+        )
+
+        linkedin_urls_raw = st.text_area(
+            "LinkedIn profile URLs (comma-separated or one per line)",
+            placeholder="https://www.linkedin.com/in/john-doe, https://www.linkedin.com/in/jane-doe",
+            height=140,
+            help="Accepted format: person profile URLs like linkedin.com/in/..."
+        )
+
+        linkedin_csv = st.file_uploader(
+            "Or upload CSV with LinkedIn URLs",
+            type=["csv"],
+            help="Any column containing LinkedIn profile URLs will be parsed"
+        )
+
+        linkedin_submitted = st.form_submit_button("🔎 Search by LinkedIn URLs", type="primary", width="stretch")
+
+        if linkedin_submitted:
+            linkedin_urls = extract_linkedin_urls(linkedin_urls_raw, linkedin_csv)
+            if not linkedin_urls:
+                st.error("Please provide at least one valid LinkedIn profile URL (linkedin.com/in/...) via text or CSV")
+                return
+
+            selected_account = account_options.get(linkedin_selected_account_name) if linkedin_selected_account_name else None
+
+            run_people_search_by_linkedin_urls(
+                linkedin_urls=linkedin_urls,
+                selected_account=selected_account,
+            )
 
 
-def run_people_search(company_name: str, title: str, limit: int, domain: str = None):
+def run_people_search(
+    company_name: str,
+    titles: list[str],
+    excluded_titles: list[str],
+    person_locations: list[str],
+    limit: int,
+    domain: str = None,
+):
     """Execute people search."""
     with st.spinner(f"Searching people at {company_name}..."):
         try:
@@ -280,7 +399,9 @@ def run_people_search(company_name: str, title: str, limit: int, domain: str = N
             company, people = service.search_people(
                 company_name=company_name,
                 domain=domain,
-                title=title if title else None,
+                titles=titles if titles else None,
+                excluded_titles=excluded_titles if excluded_titles else None,
+                person_locations=person_locations if person_locations else None,
                 limit=limit
             )
             
@@ -290,8 +411,8 @@ def run_people_search(company_name: str, title: str, limit: int, domain: str = N
             
             if not people:
                 st.warning(f"No people found at {company['name']}")
-                if title:
-                    st.info(f"Try searching without the title filter")
+                if titles or excluded_titles or person_locations:
+                    st.info("Try searching with fewer filters")
                 return
             
             # Check terminal logs for "total: 0" warning
@@ -331,6 +452,50 @@ def run_people_search(company_name: str, title: str, limit: int, domain: str = N
                 st.code(traceback.format_exc())
 
 
+def run_people_search_by_linkedin_urls(
+    linkedin_urls: list[str],
+    selected_account: dict | None = None,
+):
+    """Execute people search by person LinkedIn URLs only."""
+    with st.spinner(f"Searching {len(linkedin_urls)} LinkedIn URLs..."):
+        try:
+            service = PeopleSearchService()
+            company, people = service.search_people_by_linkedin_urls(
+                linkedin_urls=linkedin_urls,
+                limit=len(linkedin_urls),
+            )
+
+            if not people:
+                st.warning("No people matched the provided LinkedIn URLs")
+                return
+
+            if selected_account:
+                st.session_state.selected_account = selected_account
+                st.session_state.selected_account_id = selected_account.get("account_id")
+                st.session_state.company_data = {
+                    "name": selected_account.get("company_name", "LinkedIn URL Search"),
+                    "domain": selected_account.get("account_domain", ""),
+                    "linkedin_url": selected_account.get("linkedin_url", ""),
+                    "employee_count": None,
+                }
+            else:
+                st.session_state.selected_account = None
+                st.session_state.selected_account_id = None
+                st.session_state.company_data = company
+
+            st.session_state.search_results = people
+            st.session_state.step = 2
+
+            st.success(f"✅ Found {len(people)} people from LinkedIn URL search")
+            st.rerun()
+
+        except Exception as e:
+            st.error(f"LinkedIn URL search failed: {str(e)}")
+            import traceback
+            with st.expander("Error details"):
+                st.code(traceback.format_exc())
+
+
 # =============================================================================
 # Step 2: Select People for Enrichment
 # =============================================================================
@@ -362,43 +527,41 @@ def render_enrichment_step():
     
     # People selection
     st.subheader("👥 Select People")
-    
-    # Select all checkbox
-    select_all = st.checkbox("Select All", value=True)
-    
-    # Build selection - if "Select All" is checked, select everyone; otherwise use empty list for now
-    # (Individual selection would require data_editor or multiselect, keeping it simple with Select All for now)
-    if select_all:
-        selected_indices = list(range(len(people)))
-        selected_count = len(people)
-    else:
-        selected_indices = []
-        selected_count = 0
-    
-    # Create DataFrame for display
+
     display_data = []
     for person in people:
+        location_parts = [
+            person.get("location_city", ""),
+            person.get("location_region", ""),
+            person.get("location_country", ""),
+        ]
+        location_value = ", ".join([p for p in location_parts if p])
         display_data.append({
+            "select": True,
             "full_name": person.get("full_name", ""),
             "current_title": person.get("current_title", ""),
-            "location": f"{person.get('location_city', '')}, {person.get('location_region', '')}".strip(", "),
-            "has_linkedin": "✓" if person.get("linkedin_url") else "✗"
+            "location": location_value,
+            "linkedin_url": person.get("linkedin_url", ""),
         })
-    
+
     df = pd.DataFrame(display_data)
-    
-    # Show table
-    st.dataframe(
+    edited = st.data_editor(
         df,
         column_config={
+            "select": st.column_config.CheckboxColumn("Select", default=True),
             "full_name": "Name",
             "current_title": "Title",
             "location": "Location",
-            "has_linkedin": st.column_config.TextColumn("LinkedIn", width="small")
+            "linkedin_url": st.column_config.LinkColumn("LinkedIn")
         },
         hide_index=True,
-        width="stretch"
+        width="stretch",
+        use_container_width=True,
+        key="people_editor"
     )
+
+    selected_indices = edited.index[edited["select"] == True].tolist()
+    selected_count = len(selected_indices)
     
     with_linkedin = sum(1 for p in people if p.get("linkedin_url"))
     
@@ -421,6 +584,12 @@ def render_enrichment_step():
     
     with col2:
         include_phones = st.checkbox("📱 Include Phone Numbers", value=False, help="Include mobile phone number enrichment (10 credits per contact)")
+
+    skip_duplicates = st.checkbox(
+        "Skip existing contacts on save",
+        value=st.session_state.get("skip_duplicates", True),
+        help="If enabled, contacts with existing emails are skipped instead of updated"
+    )
     
     # Cost estimate
     if include_phones:
@@ -444,12 +613,23 @@ def render_enrichment_step():
                 st.error("Please select at least one person")
             else:
                 selected = [people[i] for i in selected_indices]
-                run_enrichment(selected, company, include_phones=include_phones)
+                run_enrichment(
+                    selected,
+                    company,
+                    include_phones=include_phones,
+                    skip_duplicates=skip_duplicates,
+                )
 
 
-def run_enrichment(people: list, company: dict, include_phones: bool = False):
+def run_enrichment(
+    people: list,
+    company: dict,
+    include_phones: bool = False,
+    skip_duplicates: bool = True,
+):
     """Execute enrichment."""
     st.session_state.selected_people = people
+    st.session_state.skip_duplicates = skip_duplicates
     
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -505,16 +685,29 @@ def run_enrichment(people: list, company: dict, include_phones: bool = False):
         enrichment_id = result["enrichment_id"]
         
         # Step 4: Poll for results (faster and more reliable than webhook)
-        status_text.text("⏳ Enriching contacts (typically 60-120 seconds)...")
+        # FullEnrich duration scales with batch size; avoid fixed 2-minute timeout.
+        per_contact_seconds = 35 if include_phones else 25
+        timeout_seconds = min(900, max(180, 60 + len(contacts) * per_contact_seconds))
+
+        status_text.text(
+            f"⏳ Enriching contacts (timeout {timeout_seconds // 60}m for {len(contacts)} contacts)..."
+        )
         progress_bar.progress(50)
         
-        # Use polling instead of webhook (timeout: 120s = 2 minutes)
-        poll_result = service.poll_for_results(enrichment_id, timeout=120, poll_interval=10)
+        # Use polling instead of webhook with dynamic timeout for larger batches.
+        poll_result = service.poll_for_results(
+            enrichment_id,
+            timeout=timeout_seconds,
+            poll_interval=10
+        )
         
         progress_bar.progress(90)
         
         if not poll_result:
-            st.error("❌ Enrichment timed out after 2 minutes. Check FullEnrich dashboard for status.")
+            st.error(
+                f"❌ Enrichment timed out after {timeout_seconds // 60} minutes. "
+                "Check FullEnrich dashboard for status."
+            )
             st.info(f"Enrichment ID: `{enrichment_id}`")
             return
         
@@ -568,14 +761,26 @@ def render_preview_step():
     contacts = results["contacts"]
     webhook = results["webhook_payload"]
     
+    # Show which account contacts will be saved under
+    selected_account = st.session_state.get("selected_account")
+    selected_account_id = st.session_state.get("selected_account_id")
+    if selected_account and selected_account_id:
+        st.success(
+            f"🏢 Contacts will be saved under: **{selected_account.get('company_name', '')}** "
+            f"(account_id: `{selected_account_id}`)"
+        )
+    else:
+        st.info("ℹ️ No account selected from dropdown — account will be resolved by company name.")
+    
     # Summary metrics
     credits_used = webhook.get("cost", {}).get("credits", 0) or 0
     
     col1, col2, col3 = st.columns(3)
     with col1:
-        st.metric("Accounts", len(accounts))
+        st.metric("Contacts Found", len(contacts))
     with col2:
-        st.metric("Contacts", len(contacts))
+        with_email = sum(1 for c in contacts if c.get("email"))
+        st.metric("With Email", with_email)
     with col3:
         st.metric("Credits Used", credits_used)
     
@@ -602,12 +807,10 @@ def render_preview_step():
     
     st.divider()
     
-    # Accounts Preview
-    with st.expander("🏢 View Accounts"):
-        if accounts:
-            accounts_df = pd.DataFrame(accounts)
-            st.dataframe(accounts_df, width="stretch")
-    
+    st.caption(
+        f"Save mode: {'Skip duplicates' if st.session_state.get('skip_duplicates', True) else 'Update existing contacts'}"
+    )
+
     st.divider()
     
     # Actions
@@ -617,7 +820,17 @@ def render_preview_step():
     
     with col1:
         if st.button("✅ Save to Database", type="primary", width="stretch"):
-            save_to_database(accounts, contacts, webhook)
+            # Use the dedicated account_id stored when user selected from dropdown
+            selected_account_id = st.session_state.get("selected_account_id")
+            logger.info(f"🔍 Save button clicked - selected_account_id from session: {selected_account_id}")
+            logger.info(f"🔍 Full selected_account from session: {st.session_state.get('selected_account')}")
+            save_to_database(
+                accounts,
+                contacts,
+                webhook,
+                selected_account_id=selected_account_id,
+                skip_duplicates=st.session_state.get("skip_duplicates", True),
+            )
     
     with col2:
         # Download CSV
@@ -637,14 +850,31 @@ def render_preview_step():
             st.rerun()
 
 
-def save_to_database(accounts: list, contacts: list, webhook: dict):
-    """Save enriched data to database."""
+def save_to_database(accounts: list, contacts: list, webhook: dict, selected_account_id: str = None, skip_duplicates: bool = True):
+    """Save enriched data to database, linking contacts to the selected account directly."""
+    logger.info(f"💾 save_to_database called with selected_account_id={selected_account_id}, skip_duplicates={skip_duplicates}")
+    
+    # If user selected an account from dropdown, override company_name on all contacts
+    # to match the account's company_name (not FullEnrich's version)
+    selected_account = st.session_state.get("selected_account")
+    if selected_account and selected_account_id:
+        correct_company_name = selected_account.get("company_name", "")
+        logger.info(f"Overriding company_name for all contacts: {correct_company_name}")
+        for contact in contacts:
+            contact["company_name"] = correct_company_name
+    
     with st.spinner("Saving to database..."):
         try:
             service = EnrichmentService()
             
-            # Save to final tables
-            acc_count, con_count = service.save_to_final_tables(accounts, contacts)
+            # Save to final tables — pass selected_account_id so every contact
+            # gets linked to the account the user chose from the dropdown
+            logger.info(f"Calling save_to_final_tables with selected_account_id={selected_account_id}")
+            acc_count, con_count = service.save_to_final_tables(
+                accounts, contacts, 
+                selected_account_id=selected_account_id,
+                skip_duplicates=skip_duplicates
+            )
             
             # Create history record
             from src.db.supabase_client import SupabaseClient
@@ -669,12 +899,18 @@ def save_to_database(accounts: list, contacts: list, webhook: dict):
                     contacts_inserted=len(contacts)
                 )
             
+            # Show correct account info
+            if selected_account:
+                account_info = f"**{selected_account.get('company_name', '')}** (ID: `{selected_account_id}`)"
+            else:
+                account_info = "Resolved by company name"
+            
             st.success(f"""
             ✅ **Saved to Database!**
             
-            - **Accounts:** {len(accounts)}
-            - **Contacts:** {len(contacts)}
-            - **Credits:** {credits}
+            - **Account:** {account_info}
+            - **Contacts Saved:** {con_count}
+            - **Credits Used:** {credits}
             """)
             
             if st.button("🔄 Start New Search"):

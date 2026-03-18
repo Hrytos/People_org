@@ -197,8 +197,12 @@ class FullEnrichClient:
         self,
         company_name: str = None,
         company_domain: str = None,
+        person_linkedin_urls: Optional[List[str]] = None,
         title: Optional[str] = None,
+        titles: Optional[List[str]] = None,
+        excluded_titles: Optional[List[str]] = None,
         seniority_levels: Optional[List[str]] = None,
+        person_locations: Optional[List[str]] = None,
         limit: int = 25,
         offset: Optional[int] = None,
         search_after: Optional[str] = None
@@ -211,8 +215,12 @@ class FullEnrichClient:
         Args:
             company_name: Company name (less accurate than domain)
             company_domain: Company domain (e.g. 'anthropic.com') - more accurate than name
-            title: Optional job title filter (partial match)
+            person_linkedin_urls: Optional list of person LinkedIn profile URLs
+            title: Optional single job title filter (partial match)
+            titles: Optional list of job title filters (partial match)
+            excluded_titles: Optional list of job titles to exclude
             seniority_levels: Optional list like ["Director", "VP", "C-Suite"]
+            person_locations: Optional list of person locations (city/region/country)
             limit: Results per page (max 100)
             offset: Pagination offset (max 10,000)
             search_after: Pagination token (use for offset > 10k)
@@ -239,8 +247,10 @@ class FullEnrichClient:
             logger.info(f"Searching people at domain: {company_domain}")
         elif company_name:
             logger.info(f"Searching people at: {company_name}")
+        elif person_linkedin_urls:
+            logger.info(f"Searching people by LinkedIn URLs: {len(person_linkedin_urls)} URLs")
         else:
-            raise ValueError("Either company_name or company_domain is required")
+            raise ValueError("Provide company_name, company_domain, or person_linkedin_urls")
         
         # Acquire rate limit token
         self.rate_limiter.acquire()
@@ -260,22 +270,64 @@ class FullEnrichClient:
                 "exact_match": True,
                 "exclude": False
             }]
+
+        if person_linkedin_urls:
+            clean_urls = [u.strip() for u in person_linkedin_urls if u and u.strip()]
+            if clean_urls:
+                filters["person_linkedin_urls"] = [{
+                    "value": url,
+                    "exact_match": True,
+                    "exclude": False
+                } for url in clean_urls]
         
-        # Add title filter if provided
-        if title:
-            filters["current_position_titles"] = [{
-                "value": title,
-                "exact_match": False,  # Allow partial matching
+        # Add title include/exclude filters.
+        effective_titles = []
+        if titles:
+            effective_titles.extend(titles)
+        elif title:
+            effective_titles.append(title)
+
+        effective_excluded_titles = excluded_titles or []
+
+        effective_titles = [t.strip() for t in effective_titles if t and t.strip()]
+        effective_excluded_titles = [t.strip() for t in effective_excluded_titles if t and t.strip()]
+
+        title_filters = []
+        if effective_titles:
+            title_filters.extend([{
+                "value": t,
+                "exact_match": False,
                 "exclude": False
-            }]
+            } for t in effective_titles])
+
+        if effective_excluded_titles:
+            title_filters.extend([{
+                "value": t,
+                "exact_match": False,
+                "exclude": True
+            } for t in effective_excluded_titles])
+
+        if title_filters:
+            filters["current_position_titles"] = title_filters
         
         # Add seniority filter if provided
         if seniority_levels:
+            clean_seniority_levels = [s.strip() for s in seniority_levels if s and s.strip()]
             filters["current_position_seniority_level"] = [{
                 "value": level,
-                "exact_match": True,
+                "exact_match": False,
                 "exclude": False
-            } for level in seniority_levels]
+            } for level in clean_seniority_levels]
+
+        # Add person location filters if provided
+        if person_locations:
+            clean_locations = [loc.strip() for loc in person_locations if loc and loc.strip()]
+            if clean_locations:
+                filters["person_locations"] = [{
+                    "value": loc,
+                    "exact_match": False,
+                    "exclude": False
+                } for loc in clean_locations]
         
         # Build payload - filters at root level (not wrapped in "filters" key)
         payload = {

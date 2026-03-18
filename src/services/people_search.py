@@ -80,7 +80,10 @@ class PeopleSearchService:
         company_name: str,
         domain: Optional[str] = None,
         title: Optional[str] = None,
+        titles: Optional[List[str]] = None,
+        excluded_titles: Optional[List[str]] = None,
         seniority_levels: Optional[List[str]] = None,
+        person_locations: Optional[List[str]] = None,
         limit: int = 50
     ) -> Tuple[Optional[Dict], List[Dict]]:
         """
@@ -89,9 +92,12 @@ class PeopleSearchService:
         Args:
             company_name: Company name
             domain: Optional domain (from accounts table) for better accuracy
-            title: Optional job title filter
+            title: Optional single job title filter
+            titles: Optional list of current position titles
+            excluded_titles: Optional list of titles to exclude
             seniority_levels: Optional seniority filter
-            limit: Max results
+            person_locations: Optional person locations (city/region/country)
+            limit: Target max results (auto-pagination in batches up to 100)
             
         Returns:
             Tuple of (company_dict, people_list). company_dict has name, domain, etc.
@@ -125,24 +131,70 @@ class PeopleSearchService:
                 logger.warning(f"No domain found for {company_name}, using company name (less accurate)")
         
         # Search people via API - use domain filter if we have a domain, otherwise use company name
-        if company.get("domain"):
-            result = self.fullenrich.search_people(
-                company_domain=company["domain"],
-                title=title,
-                seniority_levels=seniority_levels,
-                limit=limit
-            )
-        else:
-            result = self.fullenrich.search_people(
-                company_name=company["name"],
-                title=title,
-                seniority_levels=seniority_levels,
-                limit=limit
-            )
-        
-        people_raw = result.get("people", [])
-        total = result.get("total", 0)
-        logger.info(f"Found {len(people_raw)} people (total: {total})")
+        effective_titles = titles
+        if not effective_titles and title:
+            effective_titles = [title]
+
+        target_count = max(1, int(limit or 25))
+        collected_people: List[Dict[str, Any]] = []
+        seen_ids = set()
+        total = 0
+        offset = 0
+        search_after = None
+        pages_fetched = 0
+
+        while len(collected_people) < target_count:
+            page_size = min(100, target_count - len(collected_people))
+
+            request_kwargs: Dict[str, Any] = {
+                "title": title,
+                "titles": effective_titles,
+                "excluded_titles": excluded_titles,
+                "seniority_levels": seniority_levels,
+                "person_locations": person_locations,
+                "limit": page_size,
+            }
+
+            if company.get("domain"):
+                request_kwargs["company_domain"] = company["domain"]
+            else:
+                request_kwargs["company_name"] = company["name"]
+
+            if search_after:
+                request_kwargs["search_after"] = search_after
+            else:
+                request_kwargs["offset"] = offset
+
+            result = self.fullenrich.search_people(**request_kwargs)
+
+            page_people = result.get("people", [])
+            total = result.get("total", total)
+            search_after = result.get("search_after")
+            pages_fetched += 1
+
+            if not page_people:
+                break
+
+            for person in page_people:
+                dedupe_key = person.get("id") or person.get("linkedin_url")
+                if dedupe_key and dedupe_key in seen_ids:
+                    continue
+                if dedupe_key:
+                    seen_ids.add(dedupe_key)
+                collected_people.append(person)
+                if len(collected_people) >= target_count:
+                    break
+
+            if len(page_people) < page_size and not search_after:
+                break
+
+            if search_after is None:
+                offset += page_size
+                if total and offset >= total:
+                    break
+
+        people_raw = collected_people[:target_count]
+        logger.info(f"Found {len(people_raw)} people (total: {total}, pages_fetched: {pages_fetched})")
         
         # Warn user if no exact matches found
         if total == 0 and len(people_raw) > 0:
@@ -156,13 +208,15 @@ class PeopleSearchService:
             # Extract nested employment data
             employment = person.get("employment", {})
             current = employment.get("current", {})
-            title = current.get("title", "")
+            # FullEnrich responses can return title in nested employment data
+            # or as a top-level current_title depending on endpoint/version.
+            title = current.get("title", "") or person.get("current_title", "")
             seniority = current.get("seniority", "")
             
             # Extract LinkedIn URL from social profiles
             social = person.get("social_profiles", {})
             linkedin = social.get("linkedin", {})
-            linkedin_url = linkedin.get("url", "")
+            linkedin_url = linkedin.get("url", "") or person.get("linkedin_url", "")
             
             # Simple in-memory shape for UI and for building enrichment payload later
             people_list.append({
@@ -182,6 +236,90 @@ class PeopleSearchService:
             })
         
         return company, people_list
+
+    def search_people_by_linkedin_urls(
+        self,
+        linkedin_urls: List[str],
+        limit: int = 100,
+    ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+        """
+        Search people directly by person LinkedIn profile URLs.
+
+        Args:
+            linkedin_urls: List of person LinkedIn profile URLs
+            limit: Max number of people to return
+
+        Returns:
+            Tuple of (company_context, people_list)
+        """
+        clean_urls = [u.strip() for u in linkedin_urls if u and u.strip()]
+        if not clean_urls:
+            return {"name": "LinkedIn URL Search", "domain": ""}, []
+
+        target_count = max(1, int(limit or 100))
+        unique_urls = list(dict.fromkeys(clean_urls))
+        collected_people: List[Dict[str, Any]] = []
+        seen_ids = set()
+
+        # FullEnrich people search limit is 100; chunk URL filters to keep payload bounded.
+        for i in range(0, len(unique_urls), 100):
+            url_batch = unique_urls[i:i + 100]
+            result = self.fullenrich.search_people(
+                person_linkedin_urls=url_batch,
+                limit=min(100, target_count - len(collected_people)),
+            )
+            page_people = result.get("people", [])
+
+            for person in page_people:
+                dedupe_key = person.get("id") or person.get("linkedin_url")
+                if dedupe_key and dedupe_key in seen_ids:
+                    continue
+                if dedupe_key:
+                    seen_ids.add(dedupe_key)
+                collected_people.append(person)
+                if len(collected_people) >= target_count:
+                    break
+
+            if len(collected_people) >= target_count:
+                break
+
+        people_raw = collected_people[:target_count]
+
+        people_list = []
+        for person in people_raw:
+            employment = person.get("employment", {})
+            current = employment.get("current", {})
+            title = current.get("title", "") or person.get("current_title", "")
+            seniority = current.get("seniority", "")
+
+            social = person.get("social_profiles", {})
+            linkedin = social.get("linkedin", {})
+            linkedin_url = linkedin.get("url", "") or person.get("linkedin_url", "")
+
+            people_list.append({
+                "id": person.get("id"),
+                "fullenrich_person_id": person.get("id", ""),
+                "full_name": person.get("full_name", ""),
+                "first_name": person.get("first_name", ""),
+                "last_name": person.get("last_name", ""),
+                "title": title,
+                "current_title": title,
+                "seniority_level": seniority,
+                "linkedin_url": linkedin_url,
+                "location_city": person.get("location", {}).get("city", ""),
+                "location_region": person.get("location", {}).get("region", ""),
+                "location_country": person.get("location", {}).get("country", ""),
+                "company": current.get("company", {}),
+            })
+
+        company_context = {
+            "name": "LinkedIn URL Search",
+            "domain": "",
+            "linkedin_url": "",
+            "employee_count": None,
+        }
+        logger.info(f"LinkedIn URL search mapped {len(people_list)} people")
+        return company_context, people_list
 
 
 # =============================================================================
