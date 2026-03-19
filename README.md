@@ -1,8 +1,8 @@
 # People Search + Enrichment
 
-**Complete FullEnrich API v2 Integration with Streamlit UI**
+**Complete FullEnrich API v2 Integration with Streamlit UI + HubSpot Sync**
 
-Find people at companies by domain and enrich their contact information (emails, phones, LinkedIn profiles) using the FullEnrich API. Built for production with existing database integration.
+Find people at companies by domain, enrich their contact information (emails, phones, LinkedIn profiles) using the FullEnrich API, save to Supabase, and manually sync saved contacts to HubSpot CRM Contacts.
 
 ---
 
@@ -32,6 +32,14 @@ Find people at companies by domain and enrich their contact information (emails,
 - 🎯 **Role Calculation** - Auto-calculates role_value from job titles
 - 📈 **Credit Tracking** - Real-time balance and cost estimates
 - 📊 **Session-Based Search** - Search results in memory only
+
+### HubSpot Sync
+- 🔄 **Manual Sync Action** - Sync to HubSpot from Step 3 after database save
+- 🧠 **Property Discovery** - Maps only to HubSpot properties that exist in your portal
+- 🛡️ **Safe Mapping** - Supports internal-name and label-based matching for custom fields
+- 📦 **Batch Upsert** - Uses HubSpot batch upsert by email
+- 🧾 **Traceability Field** - Writes Supabase contact id to HubSpot `contactID`/`contactid` when available
+- 📥 **Failure Export** - Download CSV of failed HubSpot rows from UI
 
 ### UI/UX
 - 🎨 **Modern Streamlit UI** - Clean 3-step workflow
@@ -132,7 +140,9 @@ Open your browser to `http://localhost:8502`
 2. Check statistics (contacts found, enrichment success rate)
 3. Click "Save to Database"
 4. Contacts saved to your `contacts` table with `account_id` linked
-5. Click "Start Over" for new search
+5. Click "Sync to HubSpot" to push saved contacts to HubSpot CRM
+6. Review sync summary and optional failures CSV
+7. Click "Start Over" for new search
 
 ---
 
@@ -190,15 +200,20 @@ People_org/
 │   │   └── rate_limit.py          # Rate limiter (60 req/min)
 │   ├── db/                        # Database layer
 │   │   └── supabase_client.py     # Supabase client with upsert logic
+│   ├── integrations/              # External integrations
+│   │   └── hubspot.py             # HubSpot API client
 │   └── services/                  # Business logic
 │       ├── people_search.py       # Search orchestration
-│       └── enrichment.py          # Enrichment orchestration (with polling)
+│       ├── enrichment.py          # Enrichment orchestration (with polling)
+│       └── hubspot_sync.py        # HubSpot sync orchestration
 ├── supabase/
 │   └── migrations/
 │       └── 01_create_tables.sql   # Database schema
 └── docs/
     ├── FullEnrich_People_Search_and_Enrichment_Module_Plan.md
-    └── FullEnrich_Streamlit_Poetry_Deployment_Rulebook.md
+  ├── FullEnrich_Streamlit_Poetry_Deployment_Rulebook.md
+  └── memory/
+    └── HUBSPOT_INTEGRATION.md
 ```
 
 ---
@@ -215,6 +230,14 @@ People_org/
 | `RATE_LIMIT_PER_MINUTE` | No | API rate limit (default: 60) |
 | `BATCH_SIZE` | No | Max contacts per enrichment (default: 100) |
 | `REQUEST_TIMEOUT` | No | HTTP timeout in seconds (default: 30) |
+| `ENABLE_HUBSPOT_SYNC` | No | Enable HubSpot sync feature (default: false) |
+| `HUBSPOT_SERVICE_KEY` | Yes (for sync) | HubSpot private app token |
+| `HUBSPOT_BASE_URL` | No | HubSpot API base URL (default: https://api.hubapi.com) |
+| `HUBSPOT_REQUEST_TIMEOUT` | No | HubSpot timeout in seconds (default: 30) |
+| `HUBSPOT_BATCH_SIZE` | No | HubSpot upsert batch size (max 100) |
+| `HUBSPOT_DRY_RUN` | No | If true, prepare payload but do not write to HubSpot |
+| `HUBSPOT_SUPABASE_ID_PROPERTY` | No | HubSpot property to store Supabase `contacts.id` (default: contactID) |
+| `HUBSPOT_CONTACT_FIELD_MAP` | No | JSON dict to override local-to-HubSpot property mapping |
 
 ---
 
@@ -307,6 +330,16 @@ Check your balance in the UI sidebar.
 - Check network connection to Supabase
 - Test: `poetry run python -c "from src.db.supabase_client import SupabaseClient; db = SupabaseClient(); print('OK')"`
 
+### "HubSpot sync completed but some fields are empty"
+- Ensure the HubSpot target fields exist on Contact properties
+- Use HubSpot internal property names (labels may differ)
+- Optional: set `HUBSPOT_CONTACT_FIELD_MAP` in `.env` to explicitly map local fields
+
+### "HubSpot contactID/contactid is empty"
+- Confirm `HUBSPOT_SUPABASE_ID_PROPERTY` is set correctly (for your portal naming)
+- Confirm the property exists on HubSpot Contacts
+- Re-sync after save; sync writes Supabase `contacts.id` from DB rows
+
 ---
 
 ## 🔐 Security & PII
@@ -326,6 +359,7 @@ Following the Rulebook:
 - **[Complete Implementation Guide](docs/IMPLEMENTATION_GUIDE.md)** - Comprehensive 2600+ line guide covering architecture, APIs, data flow, deployment, and troubleshooting
 - [Implementation Plan](docs/FullEnrich_People_Search_and_Enrichment_Module_Plan.md)
 - [Deployment Rulebook](docs/FullEnrich_Streamlit_Poetry_Deployment_Rulebook.md)
+- [HubSpot Integration Memory](docs/memory/HUBSPOT_INTEGRATION.md)
 - [FullEnrich API Docs](https://docs.fullenrich.com)
 - [Database Schema](supabase/README_SCHEMA.md)
 
