@@ -270,6 +270,23 @@ class SupabaseClient:
             logger.warning(f"Contact lookup failed: {e}")
             return None
 
+    def get_contacts_by_emails(self, emails: List[str]) -> List[Dict[str, Any]]:
+        """
+        Fetch contacts by email list from contacts table.
+
+        Returns only rows found in DB; invalid/empty emails are ignored.
+        """
+        clean_emails = sorted({(e or "").strip() for e in emails if (e or "").strip()})
+        if not clean_emails:
+            return []
+
+        try:
+            result = self.client.table(CONTACTS_TABLE).select("*").in_("email", clean_emails).execute()
+            return result.data if result.data else []
+        except Exception as e:
+            logger.error(f"Get contacts by emails failed: {e}")
+            return []
+
     def insert_all(
         self,
         accounts: List[Dict[str, Any]],

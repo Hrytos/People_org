@@ -23,6 +23,7 @@ from src.core.config import validate_config, SUPABASE_URL, SUPABASE_SERVICE_KEY
 from src.core.logging import setup_logger
 from src.services.people_search import PeopleSearchService
 from src.services.enrichment import EnrichmentService
+from src.services.hubspot_sync import HubSpotSyncService
 
 logger = setup_logger(__name__)
 
@@ -74,6 +75,10 @@ def init_session_state():
         st.session_state.enrichment_results = None
     if 'skip_duplicates' not in st.session_state:
         st.session_state.skip_duplicates = True
+    if 'last_saved_contacts' not in st.session_state:
+        st.session_state.last_saved_contacts = []
+    if 'hubspot_sync_result' not in st.session_state:
+        st.session_state.hubspot_sync_result = None
 
 
 def reset_state():
@@ -86,6 +91,8 @@ def reset_state():
     st.session_state.selected_people = []
     st.session_state.enrichment_results = None
     st.session_state.skip_duplicates = True
+    st.session_state.last_saved_contacts = []
+    st.session_state.hubspot_sync_result = None
 
 
 def parse_csv_values(raw: str) -> list[str]:
@@ -816,7 +823,7 @@ def render_preview_step():
     # Actions
     st.subheader("⚡ Actions")
     
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     
     with col1:
         if st.button("✅ Save to Database", type="primary", width="stretch"):
@@ -848,6 +855,69 @@ def render_preview_step():
         if st.button("❌ Cancel", width="stretch"):
             reset_state()
             st.rerun()
+
+    with col4:
+        can_sync = bool(st.session_state.get("last_saved_contacts"))
+        if st.button(
+            "🔄 Sync to HubSpot",
+            width="stretch",
+            disabled=not can_sync,
+            help="Save contacts first, then sync the saved rows to HubSpot",
+        ):
+            run_hubspot_sync(st.session_state.get("last_saved_contacts", []))
+
+    sync_result = st.session_state.get("hubspot_sync_result")
+    if sync_result:
+        st.divider()
+        st.subheader("📤 HubSpot Sync Summary")
+
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.metric("Attempted", sync_result.get("attempted", 0))
+        with c2:
+            st.metric("Succeeded", sync_result.get("succeeded", 0))
+        with c3:
+            st.metric("Failed", sync_result.get("failed", 0))
+        with c4:
+            st.metric("Skipped", sync_result.get("skipped", 0))
+
+        failures = sync_result.get("failures", [])
+        if failures:
+            failure_df = pd.DataFrame(failures)
+            st.dataframe(failure_df, width="stretch")
+            st.download_button(
+                "📥 Download Sync Failures CSV",
+                failure_df.to_csv(index=False),
+                f"hubspot_sync_failures_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                "text/csv",
+                width="stretch",
+            )
+
+
+def run_hubspot_sync(saved_contacts: list):
+    """Run manual HubSpot sync for already-saved contacts."""
+    if not saved_contacts:
+        st.warning("No saved contacts available for HubSpot sync.")
+        return
+
+    with st.spinner("Syncing contacts to HubSpot..."):
+        try:
+            service = HubSpotSyncService()
+            result = service.sync_contacts(saved_contacts)
+            st.session_state.hubspot_sync_result = result
+
+            if result.get("failed", 0) > 0:
+                st.warning(
+                    f"HubSpot sync completed with partial failures: "
+                    f"{result.get('succeeded', 0)} succeeded, {result.get('failed', 0)} failed"
+                )
+            else:
+                st.success(
+                    f"✅ HubSpot sync completed: {result.get('succeeded', 0)} contacts synced"
+                )
+        except Exception as e:
+            st.error(f"❌ HubSpot sync failed: {str(e)}")
+            logger.error(f"HubSpot sync failed: {e}")
 
 
 def save_to_database(accounts: list, contacts: list, webhook: dict, selected_account_id: str = None, skip_duplicates: bool = True):
@@ -898,6 +968,15 @@ def save_to_database(accounts: list, contacts: list, webhook: dict, selected_acc
                     accounts_inserted=len(accounts),
                     contacts_inserted=len(contacts)
                 )
+
+            # Pull saved rows (including DB IDs) for downstream HubSpot sync.
+            saved_emails = [c.get("email", "") for c in contacts if c.get("email")]
+            saved_contacts = db.get_contacts_by_emails(saved_emails)
+            st.session_state.last_saved_contacts = saved_contacts
+
+            # Replace preview contacts with DB rows so IDs shown in UI match Supabase.
+            if st.session_state.get("enrichment_results") is not None and saved_contacts:
+                st.session_state.enrichment_results["contacts"] = saved_contacts
             
             # Show correct account info
             if selected_account:

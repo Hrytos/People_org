@@ -365,7 +365,6 @@ class EnrichmentMapper:
         }
         
         return {
-            "id": str(uuid.uuid4()),
             "email": email,
             "first_name": first_name,
             "last_name": last_name,

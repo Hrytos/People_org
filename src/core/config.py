@@ -6,6 +6,7 @@ Following the Rulebook: Secrets management and configuration standards.
 """
 
 import os
+import json
 from pathlib import Path
 from typing import Optional
 from dotenv import load_dotenv
@@ -29,6 +30,27 @@ FULLENRICH_BASE_URL = os.getenv(
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
+
+# =============================================================================
+# HubSpot Configuration
+# =============================================================================
+
+ENABLE_HUBSPOT_SYNC = os.getenv("ENABLE_HUBSPOT_SYNC", "false").lower() in {"1", "true", "yes"}
+HUBSPOT_SERVICE_KEY = os.getenv("HUBSPOT_SERVICE_KEY", "")
+HUBSPOT_BASE_URL = os.getenv("HUBSPOT_BASE_URL", "https://api.hubapi.com")
+HUBSPOT_REQUEST_TIMEOUT = int(os.getenv("HUBSPOT_REQUEST_TIMEOUT", "30"))
+HUBSPOT_BATCH_SIZE = min(100, int(os.getenv("HUBSPOT_BATCH_SIZE", "100")))
+HUBSPOT_DRY_RUN = os.getenv("HUBSPOT_DRY_RUN", "false").lower() in {"1", "true", "yes"}
+HUBSPOT_RATE_LIMIT_PER_MINUTE = int(os.getenv("HUBSPOT_RATE_LIMIT_PER_MINUTE", "100"))
+HUBSPOT_MAX_RETRIES = int(os.getenv("HUBSPOT_MAX_RETRIES", "4"))
+HUBSPOT_SUPABASE_ID_PROPERTY = os.getenv("HUBSPOT_SUPABASE_ID_PROPERTY", "contactID")
+_hubspot_field_map_raw = os.getenv("HUBSPOT_CONTACT_FIELD_MAP", "")
+try:
+    HUBSPOT_CONTACT_FIELD_MAP = json.loads(_hubspot_field_map_raw) if _hubspot_field_map_raw else {}
+    if not isinstance(HUBSPOT_CONTACT_FIELD_MAP, dict):
+        HUBSPOT_CONTACT_FIELD_MAP = {}
+except Exception:
+    HUBSPOT_CONTACT_FIELD_MAP = {}
 
 # =============================================================================
 # API Rate Limits (from FullEnrich docs)
@@ -102,6 +124,25 @@ def validate_config() -> bool:
         print("Please update your .env file")
         return False
     
+    return True
+
+
+def validate_hubspot_config(required: bool = False) -> bool:
+    """
+    Validate HubSpot configuration for sync workflows only.
+
+    Args:
+        required: If True, validates even when feature flag is disabled.
+
+    Returns:
+        True when configuration is usable for HubSpot sync.
+    """
+    if not required and not ENABLE_HUBSPOT_SYNC:
+        return False
+
+    if not HUBSPOT_SERVICE_KEY:
+        return False
+
     return True
 
 
