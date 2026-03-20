@@ -12,6 +12,8 @@ import streamlit as st
 import pandas as pd
 import sys
 import re
+import hmac
+import time
 from io import StringIO
 from pathlib import Path
 from datetime import datetime
@@ -19,7 +21,14 @@ from datetime import datetime
 # Add project root to path so src.* packages resolve (and relative imports inside src work)
 sys.path.insert(0, str(Path(__file__).parent))
 
-from src.core.config import validate_config, SUPABASE_URL, SUPABASE_SERVICE_KEY
+from src.core.config import (
+    APP_AUTH_ENABLED,
+    APP_AUTH_PASSWORD,
+    APP_AUTH_USERNAME,
+    SUPABASE_SERVICE_KEY,
+    SUPABASE_URL,
+    validate_config,
+)
 from src.core.logging import setup_logger
 from src.services.people_search import PeopleSearchService
 from src.services.enrichment import EnrichmentService
@@ -79,6 +88,20 @@ def init_session_state():
         st.session_state.last_saved_contacts = []
     if 'hubspot_sync_result' not in st.session_state:
         st.session_state.hubspot_sync_result = None
+    if 'authenticated' not in st.session_state:
+        st.session_state.authenticated = False
+    if 'enrichment_selected_indices' not in st.session_state:
+        st.session_state.enrichment_selected_indices = []
+    if 'enrichment_title_filter' not in st.session_state:
+        st.session_state.enrichment_title_filter = ""
+    if 'people_editor_version' not in st.session_state:
+        st.session_state.people_editor_version = 0
+    if 'enrichment_selection_people_count' not in st.session_state:
+        st.session_state.enrichment_selection_people_count = -1
+    if 'auth_failed_attempts' not in st.session_state:
+        st.session_state.auth_failed_attempts = 0
+    if 'auth_lock_until' not in st.session_state:
+        st.session_state.auth_lock_until = 0.0
 
 
 def reset_state():
@@ -93,6 +116,67 @@ def reset_state():
     st.session_state.skip_duplicates = True
     st.session_state.last_saved_contacts = []
     st.session_state.hubspot_sync_result = None
+    st.session_state.enrichment_selected_indices = []
+    st.session_state.enrichment_title_filter = ""
+    st.session_state.people_editor_version = 0
+    st.session_state.enrichment_selection_people_count = -1
+    st.session_state.auth_failed_attempts = 0
+    st.session_state.auth_lock_until = 0.0
+
+
+def _render_login_gate() -> bool:
+    """Render simple username/password login form when auth is enabled."""
+    if not APP_AUTH_ENABLED:
+        return True
+
+    if st.session_state.get("authenticated"):
+        return True
+
+    now = time.time()
+    lock_until = float(st.session_state.get("auth_lock_until", 0.0))
+    if now < lock_until:
+        wait_seconds = int(lock_until - now)
+        st.warning(f"Too many failed attempts. Try again in {wait_seconds}s.")
+        return False
+
+    left, center, right = st.columns([1.2, 1, 1.2])
+    with center:
+        st.markdown("### People Search + Enrichment")
+        st.caption("Login required")
+
+        with st.container(border=True):
+            with st.form("login_form"):
+                username = st.text_input("Username")
+                password = st.text_input("Password", type="password")
+                submitted = st.form_submit_button("Login", type="primary", width="stretch")
+
+                if submitted:
+                    valid_user = bool(APP_AUTH_USERNAME) and hmac.compare_digest(
+                        str(username), str(APP_AUTH_USERNAME)
+                    )
+                    valid_pass = bool(APP_AUTH_PASSWORD) and hmac.compare_digest(
+                        str(password), str(APP_AUTH_PASSWORD)
+                    )
+
+                    if (
+                        valid_user
+                        and valid_pass
+                    ):
+                        st.session_state.authenticated = True
+                        st.session_state.auth_failed_attempts = 0
+                        st.session_state.auth_lock_until = 0.0
+                        st.rerun()
+                    else:
+                        attempts = int(st.session_state.get("auth_failed_attempts", 0)) + 1
+                        st.session_state.auth_failed_attempts = attempts
+                        if attempts >= 5:
+                            st.session_state.auth_lock_until = time.time() + 60
+                            st.session_state.auth_failed_attempts = 0
+                            st.error("Too many failed attempts. Login locked for 60 seconds.")
+                            return False
+                        st.error("Invalid credentials")
+
+    return False
 
 
 def parse_csv_values(raw: str) -> list[str]:
@@ -170,6 +254,9 @@ def extract_linkedin_urls(raw_urls: str, csv_file) -> list[str]:
 
 def main():
     init_session_state()
+
+    if not _render_login_gate():
+        return
     
     # Header
     st.markdown('<p class="main-header">🔍 People Search + Enrichment</p>', unsafe_allow_html=True)
@@ -227,6 +314,11 @@ def render_sidebar():
         
         # Reset button
         if st.button("🔄 Start Over"):
+            reset_state()
+            st.rerun()
+
+        if APP_AUTH_ENABLED and st.button("🔐 Logout"):
+            st.session_state.authenticated = False
             reset_state()
             st.rerun()
 
@@ -535,8 +627,49 @@ def render_enrichment_step():
     # People selection
     st.subheader("👥 Select People")
 
+    # Initialize selection state only when people list size changes.
+    # Do not reset when list is intentionally empty (after deselect all).
+    if st.session_state.get("enrichment_selection_people_count", -1) != len(people):
+        st.session_state.enrichment_selected_indices = list(range(len(people)))
+        st.session_state.enrichment_selection_people_count = len(people)
+
+    selected_set = set(st.session_state.enrichment_selected_indices)
+
+    title_filter = st.text_input(
+        "Filter by title",
+        value=st.session_state.get("enrichment_title_filter", ""),
+        placeholder="e.g. manager",
+        help="Shows only matching rows by title (case-insensitive)",
+    )
+    st.session_state.enrichment_title_filter = title_filter
+
+    filter_term = (title_filter or "").strip().lower()
+    filtered_indices = [
+        i for i, person in enumerate(people)
+        if not filter_term or filter_term in (person.get("current_title", "") or "").lower()
+    ]
+
+    ctrl1, ctrl2, ctrl3 = st.columns([1, 1, 6])
+    with ctrl1:
+        if st.button("Select All", type="secondary"):
+            selected_set.update(filtered_indices)
+            st.session_state.enrichment_selected_indices = sorted(selected_set)
+            st.session_state.people_editor_version += 1
+            st.rerun()
+    with ctrl2:
+        if st.button("Deselect All", type="secondary"):
+            selected_set.difference_update(filtered_indices)
+            st.session_state.enrichment_selected_indices = sorted(selected_set)
+            st.session_state.people_editor_version += 1
+            st.rerun()
+
+    if not filtered_indices:
+        st.warning("No people match this title filter.")
+        return
+
     display_data = []
-    for person in people:
+    for original_idx in filtered_indices:
+        person = people[original_idx]
         location_parts = [
             person.get("location_city", ""),
             person.get("location_region", ""),
@@ -544,7 +677,7 @@ def render_enrichment_step():
         ]
         location_value = ", ".join([p for p in location_parts if p])
         display_data.append({
-            "select": True,
+            "select": original_idx in selected_set,
             "full_name": person.get("full_name", ""),
             "current_title": person.get("current_title", ""),
             "location": location_value,
@@ -552,6 +685,7 @@ def render_enrichment_step():
         })
 
     df = pd.DataFrame(display_data)
+    editor_key = f"people_editor_v{st.session_state.get('people_editor_version', 0)}"
     edited = st.data_editor(
         df,
         column_config={
@@ -563,20 +697,29 @@ def render_enrichment_step():
         },
         hide_index=True,
         width="stretch",
-        use_container_width=True,
-        key="people_editor"
+        key=editor_key
     )
 
-    selected_indices = edited.index[edited["select"] == True].tolist()
+    updated_selected = set(selected_set)
+    for row_idx, row in edited.iterrows():
+        original_idx = filtered_indices[int(row_idx)]
+        if bool(row.get("select")):
+            updated_selected.add(original_idx)
+        else:
+            updated_selected.discard(original_idx)
+
+    st.session_state.enrichment_selected_indices = sorted(updated_selected)
+    selected_indices = st.session_state.enrichment_selected_indices
     selected_count = len(selected_indices)
     
-    with_linkedin = sum(1 for p in people if p.get("linkedin_url"))
+    with_linkedin = sum(1 for idx in selected_indices if people[idx].get("linkedin_url"))
     
     st.info(f"""
     **Selection Summary:**
     - Selected: {selected_count} people
     - With LinkedIn URLs: {with_linkedin} (better enrichment results)
-    - Without LinkedIn: {selected_count - with_linkedin} (email/phone only)
+    - Without LinkedIn: {max(0, selected_count - with_linkedin)} (email/phone only)
+    - Visible with current filter: {len(filtered_indices)}
     """)
     
     st.divider()
@@ -972,7 +1115,25 @@ def save_to_database(accounts: list, contacts: list, webhook: dict, selected_acc
             # Pull saved rows (including DB IDs) for downstream HubSpot sync.
             saved_emails = [c.get("email", "") for c in contacts if c.get("email")]
             saved_contacts = db.get_contacts_by_emails(saved_emails)
-            st.session_state.last_saved_contacts = saved_contacts
+
+            # Keep DB ids for traceability, but prefer latest enrichment field values
+            # for HubSpot sync even when skip-duplicates is enabled.
+            db_by_email = {
+                (row.get("email") or "").strip().lower(): row
+                for row in saved_contacts
+                if row.get("email")
+            }
+            sync_contacts = []
+            for contact in contacts:
+                email_key = (contact.get("email") or "").strip().lower()
+                if not email_key or email_key not in db_by_email:
+                    continue
+                merged = dict(db_by_email[email_key])
+                merged.update(contact)
+                merged["id"] = db_by_email[email_key].get("id")
+                sync_contacts.append(merged)
+
+            st.session_state.last_saved_contacts = sync_contacts if sync_contacts else saved_contacts
 
             # Replace preview contacts with DB rows so IDs shown in UI match Supabase.
             if st.session_state.get("enrichment_results") is not None and saved_contacts:

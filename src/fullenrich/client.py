@@ -344,7 +344,7 @@ class FullEnrichClient:
         logger.info(f"🔍 People search request:")
         logger.info(f"  URL: {self.base_url}/people/search")
         logger.info(f"  Payload: {payload}")
-        logger.info(f"  Headers: {dict(self.headers)}")
+        logger.debug("  Headers: {'Authorization': 'Bearer ***', 'Content-Type': 'application/json'}")
         
         try:
             with httpx.Client(timeout=self.timeout) as client:

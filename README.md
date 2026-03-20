@@ -82,6 +82,10 @@ cp .env.example .env
 #   - FULLENRICH_API_KEY
 #   - SUPABASE_URL
 #   - SUPABASE_SERVICE_KEY
+# Optional but recommended for production:
+#   - APP_AUTH_ENABLED=true
+#   - APP_AUTH_USERNAME
+#   - APP_AUTH_PASSWORD
 ```
 
 ### 3. Setup Database
@@ -210,10 +214,10 @@ People_org/
 │   └── migrations/
 │       └── 01_create_tables.sql   # Database schema
 └── docs/
-    ├── FullEnrich_People_Search_and_Enrichment_Module_Plan.md
-  ├── FullEnrich_Streamlit_Poetry_Deployment_Rulebook.md
-  └── memory/
-    └── HUBSPOT_INTEGRATION.md
+│   ├── FullEnrich_People_Search_and_Enrichment_Module_Plan.md
+│   ├── FullEnrich_Streamlit_Poetry_Deployment_Rulebook.md
+│   └── memory/
+│       └── HUBSPOT_INTEGRATION.md
 ```
 
 ---
@@ -238,6 +242,9 @@ People_org/
 | `HUBSPOT_DRY_RUN` | No | If true, prepare payload but do not write to HubSpot |
 | `HUBSPOT_SUPABASE_ID_PROPERTY` | No | HubSpot property to store Supabase `contacts.id` (default: contactID) |
 | `HUBSPOT_CONTACT_FIELD_MAP` | No | JSON dict to override local-to-HubSpot property mapping |
+| `APP_AUTH_ENABLED` | No | Enable login gate for app access (default: false) |
+| `APP_AUTH_USERNAME` | Yes (if auth enabled) | Username for app login |
+| `APP_AUTH_PASSWORD` | Yes (if auth enabled) | Password for app login |
 
 ---
 
@@ -351,6 +358,8 @@ Following the Rulebook:
 - ✅ Database-side deduplication (email as unique key)
 - ✅ Preview before saving (user control)
 - ✅ Secure polling (direct API, no exposed webhooks)
+- ✅ Optional app login gate (`APP_AUTH_*`) for shared deployments
+- ✅ Login hardening (constant-time compare + temporary lockout after failed attempts)
 
 ---
 
@@ -384,6 +393,33 @@ Grégoire,Démogé,FullEnrich,https://www.linkedin.com/in/demoge/
 2. Connect Streamlit Cloud
 3. Add secrets in Streamlit UI
 4. Deploy
+
+Recommended Streamlit secrets:
+
+```toml
+FULLENRICH_API_KEY = "..."
+FULLENRICH_BASE_URL = "https://app.fullenrich.com/api/v2"
+
+SUPABASE_URL = "https://your-project.supabase.co"
+SUPABASE_SERVICE_KEY = "..."
+
+ENABLE_HUBSPOT_SYNC = "true"
+HUBSPOT_SERVICE_KEY = "..."
+HUBSPOT_BASE_URL = "https://api.hubapi.com"
+HUBSPOT_REQUEST_TIMEOUT = "30"
+HUBSPOT_BATCH_SIZE = "100"
+HUBSPOT_DRY_RUN = "false"
+HUBSPOT_SUPABASE_ID_PROPERTY = "contactID"
+HUBSPOT_CONTACT_FIELD_MAP = "{}"
+
+APP_AUTH_ENABLED = "true"
+APP_AUTH_USERNAME = "admin"
+APP_AUTH_PASSWORD = "replace_with_strong_password"
+```
+
+Important:
+- Do not use default passwords in production.
+- Limit app sharing to authorized users in Streamlit Cloud workspace settings.
 
 **Note:** Uses API polling - no webhook server needed!
 

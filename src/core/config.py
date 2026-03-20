@@ -53,6 +53,14 @@ except Exception:
     HUBSPOT_CONTACT_FIELD_MAP = {}
 
 # =============================================================================
+# App Authentication (optional)
+# =============================================================================
+
+APP_AUTH_ENABLED = os.getenv("APP_AUTH_ENABLED", "false").lower() in {"1", "true", "yes"}
+APP_AUTH_USERNAME = os.getenv("APP_AUTH_USERNAME", "")
+APP_AUTH_PASSWORD = os.getenv("APP_AUTH_PASSWORD", "")
+
+# =============================================================================
 # API Rate Limits (from FullEnrich docs)
 # =============================================================================
 
