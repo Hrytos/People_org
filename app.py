@@ -36,6 +36,26 @@ from src.services.hubspot_sync import HubSpotSyncService
 
 logger = setup_logger(__name__)
 
+
+def _get_runtime_auth_settings() -> tuple[bool, str, str]:
+    """Resolve auth settings from env/config with Streamlit secrets override."""
+    enabled = bool(APP_AUTH_ENABLED)
+    username = APP_AUTH_USERNAME
+    password = APP_AUTH_PASSWORD
+
+    try:
+        if "APP_AUTH_ENABLED" in st.secrets:
+            enabled = str(st.secrets["APP_AUTH_ENABLED"]).strip().lower() in {"1", "true", "yes"}
+        if "APP_AUTH_USERNAME" in st.secrets:
+            username = str(st.secrets["APP_AUTH_USERNAME"])
+        if "APP_AUTH_PASSWORD" in st.secrets:
+            password = str(st.secrets["APP_AUTH_PASSWORD"])
+    except Exception:
+        # Fall back to config/env values when secrets are unavailable.
+        pass
+
+    return enabled, username, password
+
 # =============================================================================
 # Page Configuration
 # =============================================================================
@@ -126,7 +146,9 @@ def reset_state():
 
 def _render_login_gate() -> bool:
     """Render simple username/password login form when auth is enabled."""
-    if not APP_AUTH_ENABLED:
+    auth_enabled, auth_username, auth_password = _get_runtime_auth_settings()
+
+    if not auth_enabled:
         return True
 
     if st.session_state.get("authenticated"):
@@ -151,11 +173,11 @@ def _render_login_gate() -> bool:
                 submitted = st.form_submit_button("Login", type="primary", width="stretch")
 
                 if submitted:
-                    valid_user = bool(APP_AUTH_USERNAME) and hmac.compare_digest(
-                        str(username), str(APP_AUTH_USERNAME)
+                    valid_user = bool(auth_username) and hmac.compare_digest(
+                        str(username), str(auth_username)
                     )
-                    valid_pass = bool(APP_AUTH_PASSWORD) and hmac.compare_digest(
-                        str(password), str(APP_AUTH_PASSWORD)
+                    valid_pass = bool(auth_password) and hmac.compare_digest(
+                        str(password), str(auth_password)
                     )
 
                     if (
@@ -317,7 +339,8 @@ def render_sidebar():
             reset_state()
             st.rerun()
 
-        if APP_AUTH_ENABLED and st.button("🔐 Logout"):
+        auth_enabled, _, _ = _get_runtime_auth_settings()
+        if auth_enabled and st.button("🔐 Logout"):
             st.session_state.authenticated = False
             reset_state()
             st.rerun()
